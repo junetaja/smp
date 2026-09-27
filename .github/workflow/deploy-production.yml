@@ -1,0 +1,86 @@
+name: Deploy SMP Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: smp-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:github-ci
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/smp_actions
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/smp_actions ~/.ssh/known_hosts
+
+      - name: Update website and check Nginx
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/smp_actions \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=30 \
+            junet@100.112.232.46 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          export GIT_TERMINAL_PROMPT=0
+          cd /opt/production/projects/smp
+
+          if [ "$(git branch --show-current)" != "main" ]; then
+            echo "Deployment dihentikan: branch server bukan main."
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Deployment dihentikan: ada perubahan lokal di server."
+            git status --short
+            exit 1
+          fi
+
+          git pull --ff-only origin main
+          test -s index.html
+
+          curl --fail --silent --show-error \
+            --max-time 20 \
+            -H 'Host: sotomp.gosimpli.id' \
+            http://127.0.0.1:8082/ \
+            -o /dev/null
+
+          echo "Deployment berhasil:"
+          git log -1 --format='%h %s'
+          REMOTE
+
+      - name: Remove SSH credentials
+        if: always()
+        shell: bash
+        run: |
+          rm -f ~/.ssh/smp_actions ~/.ssh/known_hosts
